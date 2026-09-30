@@ -1,0 +1,29 @@
+const assert=require('node:assert/strict');
+const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),crypto=require('node:crypto');
+const ts=require('typescript');const root=path.resolve(__dirname,'..');
+function load(file,overrides={}){const exports={};const js=ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,esModuleInterop:true}}).outputText;const requireModule=name=>{if(overrides[name])return overrides[name];if(name.startsWith('./'))return load(path.resolve(path.dirname(file),name+'.ts'),overrides);return require(require.resolve(name,{paths:[root]}));};vm.runInNewContext(js,{exports,require:requireModule,process,Buffer,URL,Uint8Array,console,Response},{filename:file});return exports;}
+const {normalizeOrigin,canonicalOrigin,safeNext,membershipFromScan}=load(root+'/lib/public-origin.ts');
+assert.equal(normalizeOrigin('https://fideli.example/'),'https://fideli.example');assert.equal(normalizeOrigin('http://localhost:3000'),'http://localhost:3000');
+for(const url of ['javascript:alert(1)','https://user:pass@fideli.example','https://fideli.example/path','http://fideli.example','https://fideli.example/?redirect=evil'])assert.throws(()=>normalizeOrigin(url));
+process.env.APP_URL='https://fideli.example';process.env.VERCEL_PROJECT_PRODUCTION_URL='prod.vercel.app';assert.equal(canonicalOrigin(),'https://fideli.example');
+delete process.env.APP_URL;delete process.env.NEXT_PUBLIC_APP_URL;assert.equal(canonicalOrigin(),'https://prod.vercel.app');delete process.env.VERCEL_PROJECT_PRODUCTION_URL;assert.equal(canonicalOrigin(),null);process.env.APP_URL='https://fideli.example';
+for(const value of ['//evil.test','https://evil.test','/\\evil.test','/\n/evil.test'])assert.equal(safeNext(value),'/customer');
+assert.equal(safeNext('/join/mon-salon?card=abc&complete=1'),'/join/mon-salon?card=abc&complete=1');
+const id='11111111-1111-4111-8111-111111111111';assert.equal(membershipFromScan(`https://fideli.example/business/caisse?membership=${id}`),id);assert.equal(membershipFromScan(id),id);assert.equal(membershipFromScan('not-a-card'),null);
+const {commerceFor,cardStatus}=load(root+'/lib/commerce.ts');assert.equal(commerceFor('Coiffeur').id,'coiffure');assert.equal(commerceFor('Restaurant').id,'restaurant');assert.equal(commerceFor('Parfumerie').id,'parfumerie');assert.equal(commerceFor('Café').id,'cafe');assert.equal(commerceFor('Autre commerce').id,'general');assert.equal(cardStatus('lost'),'Perdue · désactivée');
+const {privateKey,publicKey}=crypto.generateKeyPairSync('rsa',{modulusLength:2048,privateKeyEncoding:{type:'pkcs8',format:'pem'},publicKeyEncoding:{type:'spki',format:'pem'}});
+Object.assign(process.env,{GOOGLE_WALLET_ISSUER_ID:'123456',GOOGLE_WALLET_SERVICE_ACCOUNT_EMAIL:'wallet@example.iam.gserviceaccount.com',GOOGLE_WALLET_PRIVATE_KEY_BASE64:Buffer.from(privateKey).toString('base64'),NEXT_PUBLIC_SUPABASE_URL:'https://example.supabase.co',NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:'test-public'});
+const google=load(root+'/lib/google-wallet.ts');assert.equal(google.googleWalletConfigured(),true);const url=google.createGoogleWalletLink({membershipId:id,customerName:'Camille',businessName:'Mon salon'});assert.match(url,/^https:\/\/pay\.google\.com\/gp\/v\/save\//);const token=url.split('/').at(-1),parts=token.split('.');assert.equal(parts.length,3);assert.ok(crypto.createVerify('RSA-SHA256').update(parts[0]+'.'+parts[1]).end().verify(publicKey,Buffer.from(parts[2],'base64url')));
+const payload=JSON.parse(Buffer.from(parts[1],'base64url'));assert.equal(payload.aud,'google');assert.equal(payload.typ,'savetowallet');assert.deepEqual(payload.origins,['https://fideli.example']);assert.equal(payload.payload.genericObjects[0].barcode.value,`https://fideli.example/business/caisse?membership=${id}`);assert.equal(payload.payload.genericObjects[0].id,`123456.${id}`);
+let valid=true,owned=true,ready=true,signed=0;const filters=[];const fake={auth:{getUser:async()=>({data:{user:valid?{id:'user-1'}:null},error:valid?null:{message:'invalid'}})},from(table){return {select(){return this;},eq(k,v){filters.push([table,k,v]);return this;},maybeSingle:async()=>({data:table==='customers'?{id:'customer-1',display_name:'Camille'}:owned?{id,program:{business:{name:'Mon salon'}}}:null,error:null})};}};
+const route=load(root+'/app/api/wallet/google/route.ts',{'@supabase/supabase-js':{createClient:(url,key,options)=>{assert.equal(key,'test-public');assert.match(options.global.headers.Authorization,/^Bearer /);return fake;}},'@/lib/google-wallet':{googleWalletConfigured:()=>ready,createGoogleWalletLink:()=>{signed++;return url;}}});
+const request=(auth,body)=>({headers:new Headers(auth?{authorization:'Bearer '+auth}:{}),json:async()=>body});
+(async()=>{
+ assert.equal((await route.POST(request(null,{membershipId:id}))).status,401);assert.equal((await route.POST(request('test',{membershipId:'bad'}))).status,400);
+ valid=false;assert.equal((await route.POST(request('test',{membershipId:id}))).status,401);valid=true;
+ owned=false;assert.equal((await route.POST(request('test',{membershipId:id}))).status,404);assert.equal(signed,0);owned=true;
+ ready=false;assert.equal((await route.POST(request('test',{membershipId:id}))).status,503);ready=true;
+ const r=await route.POST(request('test',{membershipId:id}));assert.equal(r.status,200);assert.match(r.headers.get('cache-control'),/no-store/);assert.equal(signed,1);
+ assert.ok(filters.some(([t,k,v])=>t==='customers'&&k==='auth_user_id'&&v==='user-1'));assert.ok(filters.some(([t,k,v])=>t==='memberships'&&k==='customer_id'&&v==='customer-1'));
+ console.log('PASS: canonical URLs, safe return paths, QR recognition, commerce categories, lost-card label, Google JWT signature and route ownership.');
+})().catch(e=>{console.error(e);process.exit(1)});

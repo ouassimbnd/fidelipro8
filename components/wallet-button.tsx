@@ -1,0 +1,15 @@
+"use client";
+import { useEffect,useRef,useState } from 'react';
+import { supabase,errorMessage } from '@/lib/supabase';
+export function WalletButton({membershipId}:{membershipId:string}){
+ const [available,setAvailable]=useState<{apple:boolean;google:boolean}|null>(null);const [busy,setBusy]=useState('');const [message,setMessage]=useState('');const lock=useRef(false);
+ useEffect(()=>{let active=true;const controller=new AbortController();Promise.all(['apple','google'].map(async provider=>{try{const r=await fetch(`/api/wallet/${provider}`,{signal:controller.signal,cache:'no-store'});if(!r.ok)return false;return Boolean((await r.json()).configured);}catch{return false;}})).then(([apple,google])=>{if(active)setAvailable({apple,google});});return()=>{active=false;controller.abort();};},[]);
+ const save=async(provider:'apple'|'google')=>{if(lock.current)return;lock.current=true;setBusy(provider);setMessage('');try{
+  const {data:{session}}=await supabase().auth.getSession();if(!session)throw new Error('Reconnectez-vous pour ajouter votre carte.');
+  const r=await fetch(`/api/wallet/${provider}`,{method:'POST',headers:{Authorization:`Bearer ${session.access_token}`,'Content-Type':'application/json'},body:JSON.stringify({membershipId})});
+  if(!r.ok){const data=await r.json();throw new Error(data.error||'Carte indisponible.');}
+  if(provider==='google'){const data=await r.json();if(typeof data.url!=='string'||!data.url.startsWith('https://pay.google.com/gp/v/save/'))throw new Error('Lien Wallet invalide.');location.assign(data.url);return;}
+  const blob=await r.blob();const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='fideli.pkpass';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);setMessage('Sur votre iPhone, ouvrez le fichier fideli.pkpass puis appuyez sur Ajouter.');
+ }catch(e){setMessage(errorMessage(e));}finally{setBusy('');lock.current=false;}};
+ return <section className="wallet-download"><span className="kicker">VOTRE CARTE SUR TÉLÉPHONE</span><div className="wallet-provider-actions"><button className="wallet-provider apple" disabled={!available?.apple||Boolean(busy)} onClick={()=>void save('apple')}><span aria-hidden="true">▣</span><div><small>Ajouter à</small><strong>{busy==='apple'?'Préparation…':'Apple Wallet'}</strong></div></button><button className="wallet-provider google" disabled={!available?.google||Boolean(busy)} onClick={()=>void save('google')}><span aria-hidden="true">▣</span><div><small>Ajouter à</small><strong>{busy==='google'?'Préparation…':'Google Wallet'}</strong></div></button></div><p className="form-note">{available===null?'Vérification des cartes disponibles…':!available.apple&&!available.google?'Les cartes Wallet seront disponibles dès leur activation par Fideli. En attendant, votre QR fonctionne dans cet espace.':'Apple Wallet sur iPhone · Google Wallet sur Android. Vos points et récompenses restent à jour dans cet espace.'}</p>{message&&<p className="form-message" role="status">{message}</p>}</section>;
+}
